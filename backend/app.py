@@ -11,6 +11,10 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 from typing import List
+import base64
+import httpx
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from anthropic import Anthropic
 
 load_dotenv()
 
@@ -30,8 +34,8 @@ Base = declarative_base()
 # Claude 3 Opus API configuration
 OPUS_API_URL = os.getenv('OPUS_API_URL')
 OPUS_API_KEY = os.getenv('OPUS_API_KEY')
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 
-# ... (rest of the code remains the same)
 
 # Database models
 class User(Base):
@@ -104,21 +108,41 @@ def login_user(form_data: OAuth2PasswordRequestForm = Depends(), db: SessionLoca
 # Waste Classification
 @app.post('/api/waste/classify')
 def classify_waste(image: UploadFile = File(...)):
-    # Read the image file and convert it to base64
-    image_data = image.file.read()
-    image_base64 = base64.b64encode(image_data).decode('utf-8')
-    
-    # Prepare the prompt for the Opus API
-    prompt = f"Classify the waste image into one of the following categories: recyclable, compostable, general waste.\n\nImage: {image_base64}"
-    
-    # Send the prompt to the Opus API for classification
-    headers = {'Authorization': f'Bearer {OPUS_API_KEY}'}
-    data = {'prompt': prompt, 'max_tokens': 10}
     try:
-        response = requests.post(OPUS_API_URL, headers=headers, json=data)
-        response.raise_for_status()  # Raise an exception for 4xx or 5xx status codes
-        result = response.json()
-        waste_category = result['choices'][0]['text'].strip().lower()
+        # Read the image file and convert
+        image_data = base64.b64encode(image.file.read()).decode("utf-8")
+        
+        # Prepare the prompt for the Anthropic API
+        prompt = "Classify the waste image into one of the following categories: recyclable, compostable, general waste."
+        
+        # Send the image and prompt to the Anthropic API
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-3-opus-20240229",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.content_type,
+                                "data": image_data,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "data": prompt,
+                        },
+                    ],
+                }
+            ],
+        )
+        
+        # Extract the classified waste category from the API response
+        waste_category = message["completion"].strip().lower()
         
         # Validate the classified waste category
         valid_categories = ['recyclable', 'compostable', 'general waste']
@@ -126,14 +150,15 @@ def classify_waste(image: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail='Invalid waste category')
         
         return {'category': waste_category}
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPStatusError as e:
         print(f"Error: {e}")
-        print(f"Response Content: {e.response.content}")  # Print the response content for more details
+        print(f"Response Content: {e.response.content}")
         raise HTTPException(status_code=500, detail='Failed to classify waste')
-    except (KeyError, IndexError) as e:
+    except Exception as e:
         print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail='Invalid response from Opus API')
-
+        raise HTTPException(status_code=500, detail='An error occurred')
+    
+    
 # User Waste History
 @app.post('/api/waste/history', status_code=201)
 def record_waste_entry(entry: WasteEntryCreate, db: SessionLocal = Depends(get_db)):
